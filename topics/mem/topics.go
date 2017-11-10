@@ -15,6 +15,8 @@
 package mem
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/VolantMQ/volantmq/systree"
 	"github.com/VolantMQ/volantmq/topics/types"
 	"github.com/VolantMQ/volantmq/types"
+	nsq "github.com/nsqio/go-nsq"
 	"go.uber.org/zap"
 )
 
@@ -40,6 +43,8 @@ type provider struct {
 	inbound            chan *packet.Publish
 	inRetained         chan types.RetainObject
 	allowOverlapping   bool
+	producer           *nsq.Producer
+	consumer           *nsq.Consumer
 }
 
 var _ topicsTypes.Provider = (*provider)(nil)
@@ -87,6 +92,11 @@ func NewMemProvider(config *topicsTypes.MemConfig) (topicsTypes.Provider, error)
 			}
 		}
 	}
+	err := p.initMessageQueue()
+	if err != nil {
+		p.log.Warn("init message queue failed", zap.Error(err))
+		return nil, err
+	}
 
 	p.wgPublisher.Add(1)
 	p.wgPublisherStarted.Add(1)
@@ -99,6 +109,46 @@ func NewMemProvider(config *topicsTypes.MemConfig) (topicsTypes.Provider, error)
 	p.wgPublisherStarted.Wait()
 
 	return p, nil
+}
+
+func (mT *provider) initMessageQueue() error {
+	var err error
+	var p *nsq.Producer
+	var c *nsq.Consumer
+
+	p, err = nsq.NewProducer("127.0.0.1:4150", nsq.NewConfig())
+	if err != nil {
+		return err
+	}
+	mT.producer = p
+
+	c, err = nsq.NewConsumer("translateAfter", "channelA", nsq.NewConfig())
+	if err != nil {
+		return err
+	}
+	hand := func(msg *nsq.Message) error {
+		m, _, err := packet.Decode(packet.ProtocolV311, msg.Body)
+		if err != nil {
+			mT.log.Warn("decode message failed", zap.Binary("msg", msg.Body))
+			return topicsTypes.ErrUnexpectedObjectType
+		}
+
+		pubPkt, ok := m.(*packet.Publish)
+		if !ok {
+			mT.log.Warn("decode message converted to publish pkt failed", zap.Any("pkt", m))
+			return topicsTypes.ErrUnexpectedObjectType
+		}
+
+		fmt.Printf("got new message from channel translateAfter, topic: %s\n", string(pubPkt.Topic()))
+		mT.inbound <- pubPkt
+		return nil
+	}
+	c.AddHandler(nsq.HandlerFunc(hand))
+	if err := c.ConnectToNSQLookupd("127.0.0.1:4161"); err != nil {
+		return err
+	}
+	mT.consumer = c
+	return nil
 }
 
 func (mT *provider) Subscribe(filter string, s topicsTypes.Subscriber, p *topicsTypes.SubscriptionParams) (packet.QosType, []*packet.Publish, error) {
@@ -131,7 +181,33 @@ func (mT *provider) Publish(m interface{}) error {
 	if !ok {
 		return topicsTypes.ErrUnexpectedObjectType
 	}
-	mT.inbound <- msg
+
+	//mT.inbound <- msg
+	//发送消息到消息队列
+	topic := msg.Topic()
+	levels := strings.Split(topic, "/")
+	level := levels[0]
+
+	if strings.HasPrefix(level, "$") {
+		//排除系统消息,系统消息不需要翻译
+		mT.inbound <- msg
+	} else {
+		//buff := msg.Payload()
+		//json.Decode
+		//fmt.Printf("msg.Topic %s msg.Payload(): %s, Unmarshal(msg.Payload()): %#v\n", msg.Topic(), string(msg.Payload()), )
+		buff, err := packet.Encode(msg)
+		if err != nil {
+			mT.log.Warn("encode message into []byte failed", zap.Error(err), zap.Any("msg", msg))
+			return err
+		}
+		err = mT.producer.Publish("translateBefore", buff)
+		if err != nil {
+			mT.log.Warn("send message to MQ translateBefore topic failed", zap.Error(err))
+			return err
+		}
+
+		fmt.Printf("publish message topic: %s to translateBefore\n", topic)
+	}
 
 	return nil
 }
