@@ -188,7 +188,7 @@ func (mT *provider) Publish(m interface{}) error {
 	levels := strings.Split(topic, "/")
 	level := levels[0]
 
-	if strings.HasPrefix(level, "$") {
+	if strings.HasPrefix(level, "$") || (len(levels) >= 2 && levels[1] == "sys") {
 		//排除系统消息,系统消息不需要翻译
 		mT.inbound <- msg
 	} else {
